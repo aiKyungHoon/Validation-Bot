@@ -1,0 +1,17 @@
+{
+  "name": "telegram-verification-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot to validate visit requests and save to Google Sheets",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "google-auth-library": "^9.15.1",
+    "googleapis": "^134.0.0"
+  }
+}
