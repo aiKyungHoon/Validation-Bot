@@ -87,8 +87,15 @@ function validateVisitRequest(text) {
     } else {
         const dateRegex = /~?\s*\d{4}\.\d{2}\.\d{2}\s\([가-힣\/]+\)/;
         if (!dateRegex.test(visitDateTime)) {
-            errors.push('6. 방문일시 형식이 올바르지 않습니다.');
+            errors.push('6. 방문일시 형식이 올바르지 않습니다. (예: 2026.04.22 (수) 12:00)');
         }
+    }
+
+    const isFixedRaw = extractField(text, '고정여부');
+    if (!isFixedRaw) {
+        errors.push('7. 고정여부가 누락되었습니다.');
+    } else if (!isFixedRaw.includes('고정') && !isFixedRaw.includes('일회성')) {
+        errors.push('7. 고정여부는 "고정" 또는 "일회성" 단어를 포함해야 합니다.');
     }
 
     return {
@@ -116,25 +123,38 @@ function parseVisitRequest(text) {
     }
 
     const visitDateRaw = extractField(text, '방문일시') || extractField(text, '방문일');
+    const isFixedRaw = extractField(text, '고정여부');
 
     // 반복 방문 감지: "방문희망일" 필드 또는 "~" 패턴이 있으면 종료일 파싱
     const endDateLine = extractField(text, '방문희망일');
     let visit_end_date = '';
     let visit_datetime_display = normalizeVisitDateTime(visitDateRaw);
 
-    if (endDateLine) {
+    // 시작일에서 날짜와 요일 추출 (미리 파싱)
+    const startDateMatch = visitDateRaw && visitDateRaw.match(/(\d{4}\.\d{2}\.\d{2})/);
+    const dayMatch = visitDateRaw && visitDateRaw.match(/\(([가-힣\/]+)\)/);
+    const startDate = startDateMatch ? startDateMatch[1] : '';
+    const dayOfWeek = dayMatch ? dayMatch[1] : '';
+
+    if (isFixedRaw && isFixedRaw.includes('일회성')) {
+        // 일회성인 경우 종료일을 시작일(방문일)과 동일하게 설정하여 한 번만 노출되도록 함
+        if (startDate) {
+            visit_end_date = startDate;
+        }
+    } else if (endDateLine) {
+        // 기존 방문희망일 로직 (기간 지정)
         const endMatch = endDateLine.match(/(\d{4}\.\d{2}\.\d{2})/);
         if (endMatch) {
             visit_end_date = endMatch[1]; // 예: "2026.12.30"
-            // 시작일에서 날짜와 요일 추출
-            const startDateMatch = visitDateRaw && visitDateRaw.match(/(\d{4}\.\d{2}\.\d{2})/);
-            const dayMatch = visitDateRaw && visitDateRaw.match(/\(([가-힣]+)\)/);
-            const startDate = startDateMatch ? startDateMatch[1] : '';
-            const dayOfWeek = dayMatch ? dayMatch[1] : '';
             visit_datetime_display = startDate
                 ? `${startDate} ~ ${visit_end_date}${dayOfWeek ? ' (매주 ' + dayOfWeek + ')' : ''}`
                 : visit_end_date;
         }
+    } else if (isFixedRaw && isFixedRaw.includes('고정')) {
+        // 고정(요일)인 경우 무기한 반복 (종료일 없음)
+        visit_datetime_display = startDate 
+            ? `${startDate} ~ (매주 고정)`
+            : visit_datetime_display;
     }
 
     return {
