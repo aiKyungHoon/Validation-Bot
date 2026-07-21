@@ -29,7 +29,8 @@ const IGNORE_THREAD_IDS = process.env.IGNORE_THREAD_IDS ? process.env.IGNORE_THR
  */
 function extractField(text, label) {
     const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`${escapedLabel}\\s*[:：]\\s*(.*)`, 'i');
+    // 라벨 뒤에 콜론(:)이 나오기 전까지의 부가 설명문구(예: 괄호 내용)를 무시합니다.
+    const regex = new RegExp(`${escapedLabel}[^:：\\n]*[:：]\\s*(.*)`, 'i');
     const lines = text.split(/\r?\n|\r|\n|\u2028|\u2029/);
     
     for (const line of lines) {
@@ -49,8 +50,8 @@ function validateVisitRequest(text) {
 
     const idNumber = extractField(text, '고유번호');
     const phone = extractField(text, '연락처');
-    const leaderPhone = extractField(text, '구역장연락처');
-    const address = extractField(text, '현 거주지 주소(시/군까지만 기록)');
+    const leaderPhone = extractField(text, '구역장연락처') || extractField(text, '구역장 연락처');
+    const address = extractField(text, '현 거주지 주소');
     const reason = extractField(text, '방문 사유');
     const visitDateTime = extractField(text, '방문일시') || extractField(text, '방문일') || extractField(text, '방문희망일');
 
@@ -162,11 +163,11 @@ function parseVisitRequest(text) {
         visit_jipa: branch,
         visit_church: church,
         group_key: churchInfo || '미분류',
-        department: extractField(text, '소속지파/교회/부서'),
+        department: extractField(text, '소속지파'),
         name: extractField(text, '이름'),
         unique_number: extractField(text, '고유번호'),
         phone: extractField(text, '연락처'),
-        address: extractField(text, '현 거주지 주소(시/군까지만 기록)'),
+        address: extractField(text, '현 거주지 주소'),
         reason: extractField(text, '방문 사유'),
         visit_datetime_raw: visitDateRaw,
         visit_datetime_display,
