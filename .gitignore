@@ -1,4 +1,10 @@
 node_modules/
 .env
+.env.*
+!.env.example
 .npm-cache/
 scratch/
+
+# 로그 파일(개인정보·에러 내용 포함 가능)
+*.log
+logs/

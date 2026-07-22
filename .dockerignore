@@ -1,0 +1,16 @@
+# 비밀값·개인정보가 이미지에 구워지는 것을 막는다 (COPY . . 대상에서 제외)
+.env
+.env.*
+!.env.example
+
+# 로컬 전용·불필요 파일
+.git
+.gitignore
+node_modules
+.npm-cache
+scratch
+*.log
+logs/
+Dockerfile
+.dockerignore
+README.md

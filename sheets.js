@@ -77,12 +77,14 @@ async function saveToGoogleSheet(row) {
   await sheets.spreadsheets.values.append({
     spreadsheetId,
     range: 'requests!A:Q',
-    valueInputOption: 'USER_ENTERED',
+    // RAW: 사용자 입력이 시트에서 수식(=IMPORTXML 등)으로 해석되지 않도록 항상 문자열로 저장한다.
+    valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
     requestBody: { values }
   });
 
-  console.log('[Sheets] 저장 완료:', row.name, row.group_key, row.visit_end_date ? `(종료일: ${row.visit_end_date})` : '');
+  // 개인정보(이름·연락처·소속)는 로그에 남기지 않는다. 성공 여부만 기록.
+  console.log('[Sheets] 저장 완료 (1행)');
 
 }
 
@@ -110,16 +112,19 @@ async function getSheetRowsAsObjects() {
   const rows = await getSheetRows();
   if (rows.length === 0) return [];
 
-  return rows
+  const objects = rows
     .filter(row => row.length > 0 && row[0] !== 'created_at')
     .map(row => {
       const obj = {};
       COLUMN_MAP.forEach((fieldName, index) => {
         obj[fieldName] = row[index] || '';
       });
-      console.log('[Sheets] row:', obj.name, '|', obj.group_key, '|', obj.visit_datetime_display);
       return obj;
     });
+
+  // 행별 내용 대신 건수만 남긴다(개인정보 로그 축적 방지).
+  console.log(`[Sheets] 조회 완료: ${objects.length}건`);
+  return objects;
 }
 
 /**

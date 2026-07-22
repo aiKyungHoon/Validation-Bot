@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const crypto = require('crypto');
 const axios = require('axios');
 const {
     saveToGoogleSheet,
@@ -14,11 +15,64 @@ app.use(express.json());
 // 환경 변수 설정
 const PORT = process.env.PORT || 8080;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'default-secret';
+// 비밀값에는 기본값을 두지 않는다. 누락 시 아래 검사에서 기동을 중단시킨다.
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const TELEGRAM_SECRET_TOKEN = process.env.TELEGRAM_SECRET_TOKEN;
+const SUMMARY_SECRET = process.env.SUMMARY_SECRET;
 const SUMMARY_CHAT_ID = process.env.SUMMARY_CHAT_ID;
 const USE_MESSAGE_THREAD_ID = process.env.USE_MESSAGE_THREAD_ID === 'true';
 const DEFAULT_MESSAGE_THREAD_ID = process.env.DEFAULT_MESSAGE_THREAD_ID;
 const IGNORE_THREAD_IDS = process.env.IGNORE_THREAD_IDS ? process.env.IGNORE_THREAD_IDS.split(',').map(id => id.trim()) : [];
+
+/** 쉼표 구분 ID 목록을 문자열 배열로 파싱 */
+function parseIdList(raw) {
+    if (!raw) return [];
+    return String(raw).split(',').map(id => id.trim()).filter(Boolean);
+}
+
+// 봇이 응답할 채팅방 목록. 미지정 시 SUMMARY_CHAT_ID 하나만 허용한다(절대 전체 개방하지 않음).
+const ALLOWED_CHAT_IDS = parseIdList(process.env.ALLOWED_CHAT_IDS).length > 0
+    ? parseIdList(process.env.ALLOWED_CHAT_IDS)
+    : parseIdList(SUMMARY_CHAT_ID);
+
+// 관리자 전용 명령을 쓸 수 있는 사용자. 비어 있으면 관리자 명령은 아무도 쓸 수 없다(fail-closed).
+const ADMIN_USER_IDS = parseIdList(process.env.ADMIN_USER_IDS);
+
+// 비밀값 누락 상태로 절대 기동하지 않는다(빈 값 = 인증 무력화이므로 즉시 종료).
+const REQUIRED_SECRETS = {
+    TELEGRAM_BOT_TOKEN,
+    WEBHOOK_SECRET,
+    TELEGRAM_SECRET_TOKEN,
+    SUMMARY_SECRET
+};
+const missingSecrets = Object.entries(REQUIRED_SECRETS)
+    .filter(([, value]) => !value || String(value).trim() === '')
+    .map(([key]) => key);
+if (missingSecrets.length > 0) {
+    // 값 자체는 절대 출력하지 않고 이름만 알린다.
+    console.error(`[FATAL] 필수 환경변수 누락: ${missingSecrets.join(', ')} — .env.example 참고`);
+    process.exit(1);
+}
+
+// 허용 채팅방이 하나도 없으면 봇은 어디서도 동작하지 않는다. 열어두는 것보다 멈추는 쪽이 안전하다.
+if (ALLOWED_CHAT_IDS.length === 0) {
+    console.error('[FATAL] ALLOWED_CHAT_IDS(또는 SUMMARY_CHAT_ID)가 비어 있습니다 — .env.example 참고');
+    process.exit(1);
+}
+if (ADMIN_USER_IDS.length === 0) {
+    console.warn('[WARN] ADMIN_USER_IDS 미설정 — 관리자 전용 명령이 모두 비활성화됩니다. /myid 로 본인 ID를 확인해 .env에 넣으세요.');
+}
+
+/**
+ * 타이밍 공격 방지용 비밀값 비교. 길이가 달라도 안전하게 false를 돌려준다.
+ */
+function secretEquals(actual, expected) {
+    if (typeof actual !== 'string' || typeof expected !== 'string') return false;
+    const a = Buffer.from(actual);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+}
 
 // -------------------------------------------------------------
 // 핵심 함수 정의 (Telegram 관련 로직)
@@ -253,8 +307,35 @@ async function sendTelegramMessage(chatId, text, options = {}) {
     try {
         await axios.post(url, payload);
     } catch (error) {
-        console.error('[Telegram Error]', error.response ? error.response.data : error.message);
+        // 응답 본문·요청 URL에는 봇 토큰과 메시지 원문이 섞여 있으므로 상태 코드만 남긴다.
+        const status = error.response ? error.response.status : 'no-response';
+        console.error(`[Telegram Error] sendMessage 실패 (status=${status})`);
     }
+}
+
+/**
+ * 10-1. leaveChat: 허용되지 않은 그룹에서 즉시 나간다 (S11)
+ */
+async function leaveChat(chatId) {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/leaveChat`;
+    try {
+        await axios.post(url, { chat_id: chatId });
+        console.log('[Guard] 미허용 그룹에서 퇴장');
+    } catch (error) {
+        const status = error.response ? error.response.status : 'no-response';
+        console.error(`[Guard] leaveChat 실패 (status=${status})`);
+    }
+}
+
+/** 봇이 응답해도 되는 채팅방인지 */
+function isAllowedChat(chatId) {
+    return ALLOWED_CHAT_IDS.includes(String(chatId));
+}
+
+/** 관리자 전용 명령을 쓸 수 있는 사용자인지 */
+function isAdmin(userId) {
+    if (userId === undefined || userId === null) return false;
+    return ADMIN_USER_IDS.includes(String(userId));
 }
 
 /**
@@ -276,25 +357,47 @@ async function sendLongMessage(chatId, text, options = {}) {
 // -------------------------------------------------------------
 
 app.post('/webhook/:secret', async (req, res) => {
-    if (req.params.secret !== WEBHOOK_SECRET) return res.status(403).send('Forbidden');
+    // 1차: URL 경로의 무작위 시크릿, 2차: 텔레그램이 붙여 보내는 secret_token 헤더.
+    // 두 검사 모두 타이밍 안전 비교로 수행한다.
+    if (!secretEquals(req.params.secret, WEBHOOK_SECRET)) return res.status(403).send('Forbidden');
+    if (!secretEquals(req.get('X-Telegram-Bot-Api-Secret-Token') || '', TELEGRAM_SECRET_TOKEN)) {
+        return res.status(403).send('Forbidden');
+    }
 
     const update = req.body;
     if (!update || !update.message || !update.message.text) return res.status(200).send('OK');
 
     const message = update.message;
     const chatId = message.chat.id;
+    const chatType = message.chat.type;
+    const userId = message.from ? message.from.id : undefined;
     const text = message.text;
     const messageId = message.message_id;
     const threadId = message.message_thread_id || (USE_MESSAGE_THREAD_ID ? DEFAULT_MESSAGE_THREAD_ID : undefined);
+
+    // 허용 채팅방 게이트 (S11): 미허용 그룹이면 즉시 나가고, 그 외에는 어떤 반응도 하지 않는다.
+    if (!isAllowedChat(chatId)) {
+        if (chatType === 'group' || chatType === 'supergroup') {
+            await leaveChat(chatId);
+        }
+        return res.status(200).send('OK');
+    }
+
+    // 본인 ID 확인용 (ADMIN_USER_IDS 설정을 위한 부트스트랩). 요청자 본인 ID만 알려준다.
+    if (text.trim() === '/myid') {
+        await sendTelegramMessage(chatId, `당신의 ID는 ${userId} 입니다.\n관리자로 지정하려면 이 숫자를 .env의 ADMIN_USER_IDS에 넣으세요.`, { reply_to_message_id: messageId, message_thread_id: threadId });
+        return res.status(200).send('OK');
+    }
 
     // 특정 토픽(스레드) 무시 로직
     if (message.message_thread_id && IGNORE_THREAD_IDS.includes(String(message.message_thread_id))) {
         return res.status(200).send('OK'); // 무시
     }
 
-    // 토픽 ID 확인용 명령어
+    // 토픽 ID 확인용 명령어 (설정용 = 관리자 전용)
     if (text.trim() === '/topicid') {
-        const msg = message.message_thread_id 
+        if (!isAdmin(userId)) return res.status(200).send('OK'); // 무반응
+        const msg = message.message_thread_id
             ? `이 토픽의 ID는 ${message.message_thread_id} 입니다.\n\n.env 파일의 IGNORE_THREAD_IDS=${message.message_thread_id} 로 설정하면 이 토픽에서 봇이 무시합니다.`
             : `이 채팅방은 토픽이 아닙니다.`;
         await sendTelegramMessage(chatId, msg, { reply_to_message_id: messageId, message_thread_id: threadId });
@@ -315,33 +418,48 @@ app.post('/webhook/:secret', async (req, res) => {
             data.telegram_message_id = String(messageId);
             
             await saveToGoogleSheet(data);
-            
+
+            // 등록 회신은 전원에게 전체 현황을 보낸다.
+            // 같은 방 멤버는 이미 서로의 양식 원문을 보고 있고, 이 목록은 이름·방문일시만 담는다.
             const rows = await getSheetRowsAsObjects();
             const grouped = groupByChurch(rows);
             const responseMsg = buildGroupedListMessage(grouped, { isSuccess: true });
-            
             await sendLongMessage(chatId, responseMsg, { reply_to_message_id: messageId, message_thread_id: threadId });
         } catch (error) {
-            console.error(error);
+            // 예외 객체에는 요청 본문(입력 원문)·경로가 실릴 수 있어 종류만 남긴다.
+            console.error(`[Save Error] 저장 실패 (${error.code || error.name || 'Error'})`);
             await sendTelegramMessage(chatId, '⚠️ 데이터를 저장하는 중 오류가 발생했습니다.', { reply_to_message_id: messageId, message_thread_id: threadId });
         }
     } else if (text.trim() === '/목록') {
-        const rows = await getSheetRowsAsObjects();
-        const grouped = groupByChurch(rows);
-        const responseMsg = buildGroupedListMessage(grouped);
-        
-        if (!responseMsg) {
-            await sendTelegramMessage(chatId, '현재 등록된 방문 요청이 없습니다.', { reply_to_message_id: messageId, message_thread_id: threadId });
-        } else {
-            await sendLongMessage(chatId, responseMsg, { reply_to_message_id: messageId, message_thread_id: threadId });
+        // 전체 명단 조회 = 관리자 전용. 권한 없으면 존재 자체를 알리지 않도록 무반응.
+        if (!isAdmin(userId)) return res.status(200).send('OK');
+
+        try {
+            const rows = await getSheetRowsAsObjects();
+            const grouped = groupByChurch(rows);
+            const responseMsg = buildGroupedListMessage(grouped);
+
+            if (!responseMsg) {
+                await sendTelegramMessage(chatId, '현재 등록된 방문 요청이 없습니다.', { reply_to_message_id: messageId, message_thread_id: threadId });
+            } else {
+                await sendLongMessage(chatId, responseMsg, { reply_to_message_id: messageId, message_thread_id: threadId });
+            }
+        } catch (error) {
+            // try 밖에 두면 조회 실패 시 프로세스가 죽는다(unhandled rejection).
+            console.error(`[List Error] 목록 조회 실패 (${error.code || error.name || 'Error'})`);
+            await sendTelegramMessage(chatId, '⚠️ 목록을 불러오는 중 오류가 발생했습니다.', { reply_to_message_id: messageId, message_thread_id: threadId });
         }
     }
 
     res.status(200).send('OK');
 });
 
-// 자동 스케줄 요약 전송
+// 자동 스케줄 요약 전송 (스케줄러 전용 — 비밀값은 URL이 아닌 헤더로 받는다)
 app.get('/summary', async (req, res) => {
+    if (!secretEquals(req.get('X-Summary-Secret') || '', SUMMARY_SECRET)) {
+        return res.status(403).send('Forbidden');
+    }
+
     try {
         const rows = await getSheetRowsAsObjects();
         if (rows.length === 0) return res.status(200).send('No data');
@@ -354,54 +472,16 @@ app.get('/summary', async (req, res) => {
         
         res.status(200).send('Summary sent');
     } catch (error) {
+        console.error(`[Summary Error] 요약 전송 실패 (${error.code || error.name || 'Error'})`);
         res.status(500).send('Error');
     }
 });
 
-// --- 사용자 요청 테스트 엔드포인트 ---
+// 상태 확인 전용 — 어떤 데이터도 노출하지 않는다.
 app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/test-save', async (req, res) => {
-  try {
-    await saveToGoogleSheet({
-      created_at: '2026-04-23 22:00:00',
-      visit_jipa: '서울지파',
-      visit_church: '은혜교회',
-      group_key: '서울지파/은혜교회',
-      department: '서울지파/은혜교회/청년부',
-      name: '홍길동',
-      unique_number: '12345678-12345',
-      phone: '010-1234-5678',
-      address: '수원시',
-      reason: '예배 참석',
-      visit_datetime_raw: '2026.04.25 (금) 14:00',
-      visit_datetime_display: '2026.04.25 (금) 14:00',
-      manager_name: '김담당',
-      manager_phone: '010-9999-8888',
-      telegram_chat_id: '-1001234567890',
-      telegram_message_id: '101'
-    });
-    res.json({ ok: true, message: '저장 완료' });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-app.get('/test-list', async (req, res) => {
-  try {
-    const rows = await getSheetRowsAsObjects();
-    const grouped = groupByChurch(rows);
-    const result = Object.entries(grouped).map(([groupKey, items]) => ({
-      groupKey,
-      count: items.length,
-      items: sortRowsByVisitDateTime(items)
-    }));
-    res.json({ ok: true, result });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
+// 참고: /test-save, /test-list는 인증 없이 시트 쓰기·개인정보 전량 조회가 가능해 제거했다.
 
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
