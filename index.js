@@ -30,13 +30,14 @@ function parseIdList(raw) {
     return String(raw).split(',').map(id => id.trim()).filter(Boolean);
 }
 
+// 미허용 그룹에서 자동 퇴장할지 여부. 허용 목록을 구성하는 동안에는 false 로 두어 오퇴장을 막는다.
+const LEAVE_UNKNOWN_CHATS = process.env.LEAVE_UNKNOWN_CHATS !== 'false';
+
 // 봇이 응답할 채팅방 목록. 미지정 시 SUMMARY_CHAT_ID 하나만 허용한다(절대 전체 개방하지 않음).
 const ALLOWED_CHAT_IDS = parseIdList(process.env.ALLOWED_CHAT_IDS).length > 0
     ? parseIdList(process.env.ALLOWED_CHAT_IDS)
     : parseIdList(SUMMARY_CHAT_ID);
 
-// 관리자 전용 명령을 쓸 수 있는 사용자. 비어 있으면 관리자 명령은 아무도 쓸 수 없다(fail-closed).
-const ADMIN_USER_IDS = parseIdList(process.env.ADMIN_USER_IDS);
 
 // 비밀값 누락 상태로 절대 기동하지 않는다(빈 값 = 인증 무력화이므로 즉시 종료).
 const REQUIRED_SECRETS = {
@@ -59,9 +60,42 @@ if (ALLOWED_CHAT_IDS.length === 0) {
     console.error('[FATAL] ALLOWED_CHAT_IDS(또는 SUMMARY_CHAT_ID)가 비어 있습니다 — .env.example 참고');
     process.exit(1);
 }
-if (ADMIN_USER_IDS.length === 0) {
-    console.warn('[WARN] ADMIN_USER_IDS 미설정 — 관리자 전용 명령이 모두 비활성화됩니다. /myid 로 본인 ID를 확인해 .env에 넣으세요.');
+
+// 레이트 리밋 (S10): 사용자별 최근 요청 시각을 메모리에 기록해 과도한 연타를 막는다.
+// 주의 — 이 카운터는 인스턴스 로컬이다. Cloud Run 이 인스턴스를 여러 개로 늘리면
+// 인스턴스마다 카운터가 따로 논다. 이 봇은 트래픽이 적어 대개 인스턴스 1개로 유지되므로
+// 소규모 연타 방지에는 충분하다. 정밀한 분산 제한이 필요해지면 외부 스토어로 옮긴다.
+const RATE_LIMIT_WINDOW_MS = 10 * 1000; // 10초 창
+const RATE_LIMIT_MAX = 5;               // 창당 최대 5건
+const rateLimitStore = new Map();       // userId -> number[] (요청 시각들)
+
+/**
+ * userId 가 창 안에서 허용치를 넘었는지 검사한다.
+ * 넘지 않았으면 이번 요청을 기록하고 true, 넘었으면 false 를 돌려준다.
+ */
+function checkRateLimit(userId) {
+    if (userId === undefined || userId === null) return true; // 식별 불가한 요청은 통과
+    const key = String(userId);
+    const now = Date.now();
+    const recent = (rateLimitStore.get(key) || []).filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+    if (recent.length >= RATE_LIMIT_MAX) {
+        rateLimitStore.set(key, recent); // 만료분 정리분 반영
+        return false;
+    }
+    recent.push(now);
+    rateLimitStore.set(key, recent);
+    return true;
 }
+
+// 메모리 누수 방지: 주기적으로 오래된 항목을 청소한다.
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, times] of rateLimitStore) {
+        const recent = times.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+        if (recent.length === 0) rateLimitStore.delete(key);
+        else rateLimitStore.set(key, recent);
+    }
+}, RATE_LIMIT_WINDOW_MS).unref();
 
 /**
  * 타이밍 공격 방지용 비밀값 비교. 길이가 달라도 안전하게 false를 돌려준다.
@@ -332,12 +366,6 @@ function isAllowedChat(chatId) {
     return ALLOWED_CHAT_IDS.includes(String(chatId));
 }
 
-/** 관리자 전용 명령을 쓸 수 있는 사용자인지 */
-function isAdmin(userId) {
-    if (userId === undefined || userId === null) return false;
-    return ADMIN_USER_IDS.includes(String(userId));
-}
-
 /**
  * 11. sendLongMessage
  */
@@ -376,16 +404,26 @@ app.post('/webhook/:secret', async (req, res) => {
     const threadId = message.message_thread_id || (USE_MESSAGE_THREAD_ID ? DEFAULT_MESSAGE_THREAD_ID : undefined);
 
     // 허용 채팅방 게이트 (S11): 미허용 그룹이면 즉시 나가고, 그 외에는 어떤 반응도 하지 않는다.
+    // chat_id 는 개인정보가 아니라 설정에 필요한 식별자이므로, 허용 목록 구성을 위해 로그에 남긴다.
     if (!isAllowedChat(chatId)) {
-        if (chatType === 'group' || chatType === 'supergroup') {
+        console.warn(`[Guard] 미허용 채팅방 요청 차단: chat_id=${chatId} type=${chatType}`);
+        // LEAVE_UNKNOWN_CHATS=false 로 두면 나가지 않고 무반응만 한다(허용 목록 설정 중 오퇴장 방지).
+        if (LEAVE_UNKNOWN_CHATS && (chatType === 'group' || chatType === 'supergroup')) {
             await leaveChat(chatId);
         }
         return res.status(200).send('OK');
     }
 
-    // 본인 ID 확인용 (ADMIN_USER_IDS 설정을 위한 부트스트랩). 요청자 본인 ID만 알려준다.
+    // 레이트 리밋 (S10): 허용된 방 안에서도 동일 사용자의 연타는 차단한다.
+    // 초과 시 조용히 무시한다(경고 메시지 자체가 또 다른 스팸이 되지 않도록).
+    if (!checkRateLimit(userId)) {
+        console.warn(`[RateLimit] 요청 초과로 무시: user=${userId}`);
+        return res.status(200).send('OK');
+    }
+
+    // 본인 ID 확인용. 요청자 본인 ID만 알려준다.
     if (text.trim() === '/myid') {
-        await sendTelegramMessage(chatId, `당신의 ID는 ${userId} 입니다.\n관리자로 지정하려면 이 숫자를 .env의 ADMIN_USER_IDS에 넣으세요.`, { reply_to_message_id: messageId, message_thread_id: threadId });
+        await sendTelegramMessage(chatId, `당신의 ID는 ${userId} 입니다.`, { reply_to_message_id: messageId, message_thread_id: threadId });
         return res.status(200).send('OK');
     }
 
@@ -394,9 +432,9 @@ app.post('/webhook/:secret', async (req, res) => {
         return res.status(200).send('OK'); // 무시
     }
 
-    // 토픽 ID 확인용 명령어 (설정용 = 관리자 전용)
+    // 토픽 ID 확인용 명령어.
+    // 자기가 속한 토픽의 ID를 돌려줄 뿐이고 허용된 방에서만 동작하므로 멤버 누구나 쓸 수 있다.
     if (text.trim() === '/topicid') {
-        if (!isAdmin(userId)) return res.status(200).send('OK'); // 무반응
         const msg = message.message_thread_id
             ? `이 토픽의 ID는 ${message.message_thread_id} 입니다.\n\n.env 파일의 IGNORE_THREAD_IDS=${message.message_thread_id} 로 설정하면 이 토픽에서 봇이 무시합니다.`
             : `이 채팅방은 토픽이 아닙니다.`;
@@ -429,25 +467,6 @@ app.post('/webhook/:secret', async (req, res) => {
             // 예외 객체에는 요청 본문(입력 원문)·경로가 실릴 수 있어 종류만 남긴다.
             console.error(`[Save Error] 저장 실패 (${error.code || error.name || 'Error'})`);
             await sendTelegramMessage(chatId, '⚠️ 데이터를 저장하는 중 오류가 발생했습니다.', { reply_to_message_id: messageId, message_thread_id: threadId });
-        }
-    } else if (text.trim() === '/목록') {
-        // 전체 명단 조회 = 관리자 전용. 권한 없으면 존재 자체를 알리지 않도록 무반응.
-        if (!isAdmin(userId)) return res.status(200).send('OK');
-
-        try {
-            const rows = await getSheetRowsAsObjects();
-            const grouped = groupByChurch(rows);
-            const responseMsg = buildGroupedListMessage(grouped);
-
-            if (!responseMsg) {
-                await sendTelegramMessage(chatId, '현재 등록된 방문 요청이 없습니다.', { reply_to_message_id: messageId, message_thread_id: threadId });
-            } else {
-                await sendLongMessage(chatId, responseMsg, { reply_to_message_id: messageId, message_thread_id: threadId });
-            }
-        } catch (error) {
-            // try 밖에 두면 조회 실패 시 프로세스가 죽는다(unhandled rejection).
-            console.error(`[List Error] 목록 조회 실패 (${error.code || error.name || 'Error'})`);
-            await sendTelegramMessage(chatId, '⚠️ 목록을 불러오는 중 오류가 발생했습니다.', { reply_to_message_id: messageId, message_thread_id: threadId });
         }
     }
 

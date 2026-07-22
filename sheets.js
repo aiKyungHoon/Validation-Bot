@@ -32,12 +32,12 @@ function getGoogleAuth() {
     throw new Error('Google Sheets 인증용 환경변수가 없습니다.');
   }
 
-  return new google.auth.JWT(
-    clientEmail,
-    null,
-    privateKey.replace(/\\n/g, '\n'),
-    SCOPES
-  );
+  // google-auth-library v10부터 위치 인자 생성자가 없어져 옵션 객체 방식만 동작한다.
+  return new google.auth.JWT({
+    email: clientEmail,
+    key: privateKey.replace(/\\n/g, '\n'),
+    scopes: SCOPES
+  });
 }
 
 function getSheetsClient() {
